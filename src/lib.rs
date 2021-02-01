@@ -87,12 +87,12 @@ pub use self::message::request::CoAPRequest;
 pub use self::message::request::Method;
 pub use self::message::response::CoAPResponse;
 pub use self::message::response::Status;
-pub use self::observer::Observer;
-pub use self::server::{Server, CoAPServer};
+//pub use self::observer::Observer;
+//pub use self::server::{Server, CoAPServer};
 pub mod message;
 pub mod client;
-pub mod server;
-mod observer;
+//pub mod server;
+//mod observer;
 
 
 

@@ -90,8 +90,7 @@ impl Decoder for Codec {
     }
 }
 
-impl Encoder for Codec {
-    type Item = Packet;
+impl Encoder<Packet> for Codec {
     type Error = io::Error;
 
     fn encode(&mut self, my_packet: Packet, buf: &mut BytesMut) -> Result<(), io::Error> {

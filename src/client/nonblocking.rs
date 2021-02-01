@@ -8,11 +8,16 @@ use std::net::SocketAddr;
 
 use log::{error, debug, trace};
 
-use tokio::net::{UdpSocket, udp::SendHalf};
+use futures::{Stream};
+
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt, ReadBuf};
+use tokio::net::{UdpSocket};
 use tokio::{task, time};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{channel, Sender, Receiver};
-use tokio::stream::StreamExt;
+
+use openssl::ssl::{SslMethod, SslVerifyMode, SslFiletype};
+
 
 use crate::Method;
 use crate::message::packet::{Packet, ObserveOption};
@@ -25,29 +30,259 @@ use super::RequestOptions;
 pub const COAP_MTU: usize = 1600;
 
 pub struct CoAPClientAsync<Transport> {
-    peer_addr: SocketAddr,
-    udp_tx: SendHalf,
+    int_tx: Sender<Vec<u8>>,
     message_id: u16,
     _listener: task::JoinHandle<Result<()>>,
     _transport: PhantomData<Transport>,
     rx_handles: Arc<Mutex<HashMap<u32, (SenderKind, Sender<CoAPResponse>)>>>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 enum SenderKind {
     Request,
     Observer,
 }
 
+// https://github.com/fdeantoni/async-coap-dtls/blob/master/src/dtls/connector.rs
 
+
+pub struct UdpStream {
+    socket: tokio::net::UdpSocket,
+}
+
+impl From<tokio::net::UdpSocket> for UdpStream {
+    fn from(socket: tokio::net::UdpSocket) -> Self {
+        Self{ socket }
+    }
+}
+
+impl std::io::Read for UdpStream {
+    fn read(&mut self, buff: &mut [u8]) -> std::result::Result<usize, std::io::Error> {
+        self.socket.try_recv(buff)
+    }
+}
+
+impl std::io::Write for UdpStream {
+    fn write(&mut self, buff: &[u8]) -> std::result::Result<usize, std::io::Error> { 
+        self.socket.try_send(buff)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl AsyncRead for UdpStream {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<Result<()>> {
+        match self.socket.poll_recv(cx, buf) {
+            Poll::Ready(Ok(_n)) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for UdpStream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
+        self.socket.poll_send(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl CoAPClientAsync<UdpStream> {
+    /// EXPERIMENTAL: create a new CoAP client using the DTLS transport
+    pub async fn new_dtls(peer: &str, ca_file: &str, cert_file: &str, key_file: &str) -> Result<Self> {
+        // Bind UDP sockety
+        let udp_socket = Self::udp_connect(peer).await?;
+
+        // Bind UDP socket
+        let udp_stream = UdpStream::from(udp_socket);
+
+        // Setup openssl connector
+        let mut ssl_builder = openssl::ssl::SslConnector::builder(SslMethod::dtls()).unwrap();
+
+        ssl_builder.set_verify(SslVerifyMode::NONE);
+        ssl_builder.set_ca_file(ca_file)?;
+        ssl_builder.set_certificate_file(cert_file, SslFiletype::PEM)?;
+        ssl_builder.set_private_key_file(key_file, SslFiletype::PEM)?;
+
+        let ssl_conn = ssl_builder.build();
+
+        // Coerce to native_tls
+        let mut tls_builder = native_tls::TlsConnector::builder();
+        tls_builder.danger_accept_invalid_hostnames(true);
+        let tls_conn = tls_builder.from_openssl(ssl_conn);
+
+        // Coerce to tokio_native_tls
+        let async_tls_conn = tokio_native_tls::TlsConnector::from(tls_conn);
+
+        // Attempt DTLS connection
+        let tls_sock = async_tls_conn.connect(peer, udp_stream).await.unwrap();
+
+        let (mut net_rx, mut net_tx) = tokio::io::split(tls_sock);
+
+        let rx_handles = Arc::new(Mutex::new(HashMap::<u32, (SenderKind, Sender<CoAPResponse>)>::new()));
+        let (int_tx, mut int_rx) = channel::<Vec<u8>>(10);
+
+        // TODO: start listener task
+        let handles = rx_handles.clone();
+        let listener = tokio::task::spawn(async move {
+            let mut buff = [0u8; COAP_MTU];
+
+            loop {
+                tokio::select!(
+                    r = net_rx.read(&mut buff) => {
+                        match r {
+                            Ok(n) => {
+                                debug!("net receive: {:?}", &buff[..n]);
+
+                                let message = match Packet::from_bytes(&buff[..n]) {
+                                    Ok(v) => CoAPResponse { message: v },
+                                    Err(e) => {
+                                        debug!("decode error: {:?}", e);
+                                        continue;
+                                    }
+                                };
+
+                                let token = Self::token_from_slice(message.get_token());
+
+                                let handle = handles.lock().await.get(&token).map(|v| v.clone() );
+                                match handle {
+                                    Some((kind, tx)) => {
+                                        tx.send(message).await.unwrap();
+
+                                        if kind == SenderKind::Request {
+                                            handles.lock().await.remove(&token);
+                                        }
+                                    },
+                                    None => {
+                                        debug!("unhandled response: {:?}", message);
+                                        continue;
+                                    }
+                                }
+                                
+                            },
+                            Err(e) => {
+                                error!("net receive error: {:?}", e);
+                                break;
+                            }
+                        }
+                    },
+                    Some(v) = int_rx.recv() => {
+                        debug!("net tx: {:?}", v);
+                        if let Err(e) = net_tx.write(&v[..]).await {
+                            error!("net transmit error: {:?}", e);
+                            break;
+                        }
+                    }
+                )
+            }
+
+            Ok(())
+        });
+
+        Ok(Self{
+            int_tx,
+            _listener: listener,
+            message_id: 0,
+            _transport: PhantomData,
+            rx_handles,
+        })
+    }
+}
 
 impl CoAPClientAsync<tokio::net::UdpSocket> {
-    pub async fn new_udp<A>(peer_addr: A) -> Result<Self> 
-    where
-        A: tokio::net::ToSocketAddrs,
-    {
-        // Resolve peer address to determine local socket type
-        let peer_addr = peer_addr.to_socket_addrs().await?.next();
 
+    pub async fn new_udp(peer: &str) -> Result<Self> 
+    {
+        // Connect to UDP socket
+        let udp_sock = Self::udp_connect(peer).await?;
+
+        let rx_handles = Arc::new(Mutex::new(HashMap::<u32, (SenderKind, Sender<CoAPResponse>)>::new()));
+        let (int_tx, mut int_rx) = channel::<Vec<u8>>(10);
+
+        // TODO: start listener thread
+        let handles = rx_handles.clone();
+        let listener = tokio::task::spawn(async move {
+            let mut buff = [0u8; COAP_MTU];
+
+            loop {
+                tokio::select!(
+                    r = udp_sock.recv(&mut buff) => {
+                        match r {
+                            Ok(n) => {
+                                debug!("net receive: {:?}", &buff[..n]);
+
+                                let message = match Packet::from_bytes(&buff[..n]) {
+                                    Ok(v) => CoAPResponse { message: v },
+                                    Err(e) => {
+                                        debug!("decode error: {:?}", e);
+                                        continue;
+                                    }
+                                };
+
+                                let token = Self::token_from_slice(message.get_token());
+
+                                let handle = handles.lock().await.get(&token).map(|v| v.clone() );
+                                match handle {
+                                    Some((kind, tx)) => {
+                                        tx.send(message).await.unwrap();
+
+                                        if kind == SenderKind::Request {
+                                            handles.lock().await.remove(&token);
+                                        }
+                                    },
+                                    None => {
+                                        debug!("unhandled response: {:?}", message);
+                                        continue;
+                                    }
+                                }
+                            },
+                            Err(e) => {
+                                error!("net receive error: {:?}", e);
+                                break;
+                            }
+                        }
+                    },
+                    Some(v) = int_rx.recv() => {
+                        debug!("net tx: {:?}", v);
+                        if let Err(e) = udp_sock.send(&v[..]).await {
+                            error!("net transmit error: {:?}", e);
+                            break;
+                        }
+                    }
+                )
+            }
+
+            Ok(())
+        });
+
+        Ok(Self{
+            int_tx,
+            _listener: listener,
+            message_id: 0,
+            _transport: PhantomData,
+            rx_handles,
+        })
+    }
+}
+
+
+impl <T>CoAPClientAsync<T> {
+     /// Helper to create UDP connections
+     async fn udp_connect(peer: &str) -> Result<tokio::net::UdpSocket> {
+
+        // Resolve peer address to determine local socket type
+        let peer_addr = tokio::net::lookup_host(peer).await?.next();
+
+        // Work out bind address
         let bind_addr = match peer_addr {
             Some(SocketAddr::V6(_)) => ":::0",
             Some(SocketAddr::V4(_)) => "0.0.0.0:0",
@@ -56,84 +291,21 @@ impl CoAPClientAsync<tokio::net::UdpSocket> {
                 return Err(Error::new(ErrorKind::NotFound, "no peer address found"));
             }
         };
-
         let peer_addr = peer_addr.unwrap();
 
         // Bind to local socket
-        let transport = UdpSocket::bind(bind_addr).await
+        let udp_sock = UdpSocket::bind(bind_addr).await
             .map_err(|e| {
                 error!("Error binding local socket: {:?}", e);
                 e
             })?;
 
-        debug!("Bound to socket: {}", transport.local_addr()?);
+        debug!("Bound to socket: {}", udp_sock.local_addr()?);
 
-        let (mut udp_rx, udp_tx) = transport.split();
+        // Connect to remote socket
+        udp_sock.connect(peer_addr).await?;
 
-        let rx_handles = Arc::new(Mutex::new(HashMap::<_, (SenderKind, Sender<CoAPResponse>)>::new()));
-        let h = rx_handles.clone();
-
-        // Create listener task
-        let _listener = task::spawn(async move {
-            let mut buff = vec![0u8; COAP_MTU];
-
-            debug!("Started listener task");
-
-            loop {
-                // Receive from socket
-                let (n, a) = match udp_rx.recv_from(&mut buff).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        error!("Socket error: {:?}", e);
-                        return Err(e);
-                    }
-                };
-
-                trace!("Received data: {:?} from {:?}", &buff[..n], a);
-
-                // Parse out packet
-                let p = match Packet::from_bytes(&buff[..n]) {
-                    Ok(packet) => packet,
-                    Err(_) => {
-                        error!("Error decoding packet: {:?}", &buff[..n]);
-                        return Err(Error::new(ErrorKind::InvalidInput, "packet error"))
-                    },
-                };
-
-                debug!("Received packet: {:?}", p);
-
-                // Fetch transaction token
-                let token = Self::token_from_slice(p.get_token());
-
-                // Locate matching request sender
-                let mut handles = h.lock().await;
-                let (kind, tx) = match handles.get_mut(&token) {
-                    Some(v) => v,
-                    None => {
-                        // No handler bound, drop
-                        continue;
-                    }
-                };
-
-                // Send response
-                tx.send(CoAPResponse { message: p }).await.map_err(|e| Error::new(ErrorKind::Other, e))?;
-
-                // Remove handle when done
-                match kind {
-                    SenderKind::Request => handles.remove(&token),
-                    _ => None,
-                };
-            }
-        });
-
-        Ok(Self {
-            udp_tx,
-            peer_addr,
-            message_id: 0,
-            _listener,
-            _transport: PhantomData,
-            rx_handles,
-        })
+        Ok(udp_sock)
     }
 
     // Convenience method to perform a Get request
@@ -177,25 +349,23 @@ impl CoAPClientAsync<tokio::net::UdpSocket> {
 
     // Execute a CoAP request and return a response
     pub async fn request(&mut self, request: &CoAPRequest, options: &RequestOptions) -> Result<CoAPResponse> {
-        debug!("{:?} resource: {:?} at {:?}", request.get_method(), request.get_path(), self.peer_addr);
+        debug!("{:?} resource: {:?}", request.get_method(), request.get_path());
 
         // Fetch token from message
         let token = Self::token_from_slice(request.get_token());
-
-        // Encode message
-        let b = request.message.to_bytes().map_err(|_e| Error::new(ErrorKind::InvalidInput, "packet error"))?;
         
         // Generate response channel
         let (tx, mut rx) = channel(1);
         self.rx_handles.lock().await.insert(token, (SenderKind::Request, tx));
 
-        self.do_request(&b, &mut rx, options).await
+        // Execute request
+        self.do_request(request.message.clone(), &mut rx, options).await
     }
 
     // Start observation on a topic
     pub async fn observe(&mut self, resource: &str, options: &RequestOptions) -> Result<CoAPObserverAsync> {
 
-        debug!("Observe resource: {:?} on {:?}", resource, self.peer_addr);
+        debug!("Observe resource: {:?}", resource);
 
         // Setup registration message
         let mut register_req = self.new_request(Method::Get, resource, None, options);
@@ -203,15 +373,12 @@ impl CoAPClientAsync<tokio::net::UdpSocket> {
 
         let token = Self::token_from_slice(register_req.get_token());
 
-        // Encode message
-        let b = register_req.message.to_bytes().map_err(|_e| Error::new(ErrorKind::InvalidInput, "packet error"))?;
-
         // Setup response channel
         let (tx, mut rx) = channel(10);
-        let mut tx1 = tx.clone();
+        let tx1 = tx.clone();
         self.rx_handles.lock().await.insert(token, (SenderKind::Observer, tx));
 
-        let register_resp = self.do_request(&b, &mut rx, options).await?;
+        let register_resp = self.do_request(register_req.message, &mut rx, options).await?;
 
         // Handle response errors (expect a 2.05 on successful observe)
         if *register_resp.get_status() != Status::Content {
@@ -247,15 +414,23 @@ impl CoAPClientAsync<tokio::net::UdpSocket> {
         Ok(())
     }
 
-    async fn do_request(&mut self, encoded: &[u8], rx: &mut Receiver<CoAPResponse>, options: &RequestOptions) -> Result<CoAPResponse> {
+    async fn do_request(&mut self, message: Packet, rx: &mut Receiver<CoAPResponse>, options: &RequestOptions) -> Result<CoAPResponse> {
 
         for _i in 0..options.retries {
+
+            // Encode message
+            let encoded = message.to_bytes().map_err(|_e| Error::new(ErrorKind::InvalidInput, "packet error"))?;
+
             // Send encoded data
             trace!("Transmit data: {:?}", encoded);
-            let _n = self.udp_tx.send_to(&encoded, &self.peer_addr).await?;
+
+            if let Err(e) = self.int_tx.send(encoded).await {
+                error!("request error: {:?}", e);
+                continue;
+            }
 
             // Await response
-            match time::timeout(options.timeout, rx.next()).await {
+            match time::timeout(options.timeout, rx.recv()).await {
                 Ok(Some(v)) => return Ok(v),
                 _ => continue,
             }
@@ -296,17 +471,18 @@ impl CoAPObserverAsync {
     }
 }
 
-impl tokio::stream::Stream for CoAPObserverAsync {
+impl Stream for CoAPObserverAsync {
     type Item = CoAPResponse;
 
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.rx).poll_next(ctx)
+        Pin::new(&mut self.rx).poll_recv(ctx)
     }
 }
 
 #[cfg(test)]
 mod test {
     use std::time::Duration;
+    use futures::StreamExt;
     
     use crate::*;
     use super::*;
