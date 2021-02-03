@@ -29,11 +29,10 @@ use super::RequestOptions;
 
 pub const COAP_MTU: usize = 1600;
 
-pub struct CoAPClientAsync<Transport> {
+pub struct CoAPClientAsync {
     int_tx: Sender<Vec<u8>>,
     message_id: u16,
     _listener: task::JoinHandle<Result<()>>,
-    _transport: PhantomData<Transport>,
     rx_handles: Arc<Mutex<HashMap<u32, (SenderKind, Sender<CoAPResponse>)>>>,
 }
 
@@ -96,9 +95,11 @@ impl AsyncWrite for UdpStream {
     }
 }
 
-impl CoAPClientAsync<UdpStream> {
+impl CoAPClientAsync {
     /// EXPERIMENTAL: create a new CoAP client using the DTLS transport
     pub async fn new_dtls(peer: &str, ca_file: &str, cert_file: &str, key_file: &str) -> Result<Self> {
+        debug!("Creating DTLS listener");
+
         // Bind UDP sockety
         let udp_socket = Self::udp_connect(peer).await?;
 
@@ -124,6 +125,7 @@ impl CoAPClientAsync<UdpStream> {
         let async_tls_conn = tokio_native_tls::TlsConnector::from(tls_conn);
 
         // Attempt DTLS connection
+        // TODO: this needs a timeout..?
         let tls_sock = async_tls_conn.connect(peer, udp_stream).await.unwrap();
 
         let (mut net_rx, mut net_tx) = tokio::io::split(tls_sock);
@@ -185,6 +187,8 @@ impl CoAPClientAsync<UdpStream> {
                 )
             }
 
+            debug!("Exit net thread");
+
             Ok(())
         });
 
@@ -192,13 +196,12 @@ impl CoAPClientAsync<UdpStream> {
             int_tx,
             _listener: listener,
             message_id: 0,
-            _transport: PhantomData,
             rx_handles,
         })
     }
 }
 
-impl CoAPClientAsync<tokio::net::UdpSocket> {
+impl CoAPClientAsync {
 
     pub async fn new_udp(peer: &str) -> Result<Self> 
     {
@@ -268,14 +271,13 @@ impl CoAPClientAsync<tokio::net::UdpSocket> {
             int_tx,
             _listener: listener,
             message_id: 0,
-            _transport: PhantomData,
             rx_handles,
         })
     }
 }
 
 
-impl <T>CoAPClientAsync<T> {
+impl CoAPClientAsync {
      /// Helper to create UDP connections
      async fn udp_connect(peer: &str) -> Result<tokio::net::UdpSocket> {
 
@@ -300,7 +302,7 @@ impl <T>CoAPClientAsync<T> {
                 e
             })?;
 
-        debug!("Bound to socket: {}", udp_sock.local_addr()?);
+        debug!("Bound to local socket: {}", udp_sock.local_addr()?);
 
         // Connect to remote socket
         udp_sock.connect(peer_addr).await?;
