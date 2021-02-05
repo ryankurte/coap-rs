@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Receive updates
             while let Some(resp) = rx.next().await {
-                info!("Received: {:?}", resp);
+                println!("Received: {:?}", resp);
             }
             
             return Ok(())

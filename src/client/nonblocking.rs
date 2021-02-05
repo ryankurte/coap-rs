@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::task::{Poll, Context};
 use std::pin::Pin;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use log::{error, debug, trace};
 
@@ -125,8 +126,14 @@ impl CoAPClientAsync {
         let async_tls_conn = tokio_native_tls::TlsConnector::from(tls_conn);
 
         // Attempt DTLS connection
-        // TODO: this needs a timeout..?
-        let tls_sock = async_tls_conn.connect(peer, udp_stream).await.unwrap();
+        // TODO: customise timeout
+        let tls_sock = match time::timeout(Duration::from_secs(2), async_tls_conn.connect(peer, udp_stream)).await? {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("DTLS error: {:?}", e);
+                return Err(Error::new(ErrorKind::Other, "DTLS failed"));
+            }
+        };
 
         let (mut net_rx, mut net_tx) = tokio::io::split(tls_sock);
 
